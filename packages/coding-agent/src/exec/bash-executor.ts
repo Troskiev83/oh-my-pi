@@ -10,6 +10,7 @@ import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "../session/streaming-output";
+import { isCaptureLimitError } from "../session/capture-policy";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
@@ -412,6 +413,7 @@ async function executeUserShellPty(run: {
 	graphics: TerminalGraphicsDecoder;
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
+	let captureLimitError: Error | undefined;
 	const session = new PtySession();
 	const result = await session.startArgv(
 		{
@@ -425,14 +427,22 @@ async function executeUserShellPty(run: {
 			rows: run.pty.rows,
 		},
 		(err, chunk) => {
-			if (err || !chunk) return;
+			if (err || !chunk || captureLimitError) return;
 			run.pty.onChunk(chunk);
 			// Preserve raw bytes for the terminal display, but extract graphics
 			// before the transcript sink sanitizes or truncates the clean text.
 			const clean = run.graphics.push(chunk);
-			if (clean) run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+			if (!clean) return;
+			try {
+				run.sink.push(clean.replace(/\r\n?/gu, "\n"));
+			} catch (error) {
+				if (!isCaptureLimitError(error)) throw error;
+				captureLimitError = error;
+				session.kill();
+			}
 		},
 	);
+	if (captureLimitError) throw captureLimitError;
 	if (result.timedOut) {
 		return {
 			exitCode: undefined,
@@ -522,10 +532,19 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let acceptingChunks = true;
 	let graphicsFinished = false;
 	let decodedImages: ImageContent[] = [];
-	const enqueueChunk = (chunk: string) => {
-		if (!acceptingChunks) return;
+	let captureLimitError: Error | undefined;
+	const enqueueChunk = (chunk: string): void => {
+		if (!acceptingChunks || graphicsFinished) return;
 		const clean = graphics.push(chunk);
-		if (clean) sink.push(clean);
+		if (!clean) return;
+		try {
+			sink.push(clean);
+		} catch (error) {
+			if (!isCaptureLimitError(error)) throw error;
+			captureLimitError = error;
+			acceptingChunks = false;
+			abortCurrentExecution();
+		}
 	};
 	const dump = async (notice?: string): Promise<OutputSummary & { images?: ImageContent[] }> => {
 		if (!graphicsFinished) {
@@ -665,6 +684,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			timeoutDeferred.promise.then(kind => ({ kind })),
 			abortDeferred.promise.then(kind => ({ kind })),
 		]);
+		if (captureLimitError) {
+			acceptingChunks = false;
+			const cleanupPromise = abortShell();
+			await Promise.allSettled([runPromise, cleanupPromise]);
+			throw captureLimitError;
+		}
 
 		if (winner.kind === "timeout" || winner.kind === "abort") {
 			acceptingChunks = false;

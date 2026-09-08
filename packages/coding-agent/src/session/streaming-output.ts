@@ -1,5 +1,6 @@
 import type { AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { formatBytes, materializeString, sanitizeText } from "@oh-my-pi/pi-utils";
+import { createCaptureWriter, getCapturePolicy } from "./capture-policy";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 
 // =============================================================================
@@ -814,6 +815,7 @@ export class OutputSink {
 	readonly #onChunk?: (chunk: string) => void;
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
+	readonly #captureWriter = createCaptureWriter();
 
 	// Optional artifact-on-disk cap. When `#artifactMaxBytes > 0` the file sink
 	// owns a head budget + a rolling tail buffer; once the head is closed,
@@ -839,8 +841,15 @@ export class OutputSink {
 			maxColumns = 0,
 			onChunk,
 			chunkThrottleMs = 0,
-			artifactMaxBytes = ARTIFACT_DEFAULT_MAX_BYTES,
-			artifactHeadBytes = ARTIFACT_DEFAULT_HEAD_BYTES,
+			artifactMaxBytes = getCapturePolicy()
+				? getCapturePolicy()!.toolMaxBytes - getCapturePolicy()!.reserveBytes
+				: ARTIFACT_DEFAULT_MAX_BYTES,
+			artifactHeadBytes = Math.min(
+				ARTIFACT_DEFAULT_HEAD_BYTES,
+				getCapturePolicy()
+					? getCapturePolicy()!.toolMaxBytes - getCapturePolicy()!.reserveBytes
+					: ARTIFACT_DEFAULT_HEAD_BYTES,
+			),
 		} = options ?? {};
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
@@ -893,8 +902,15 @@ export class OutputSink {
 	 */
 	push(chunk: string): void {
 		if (this.#finalized) return;
-		chunk = sanitizeWithOptionalSixelPassthrough(chunk, text => sanitizeText(this.#normalizeCarriageReturns(text)));
+		const redacted = this.#captureWriter?.push(chunk) ?? chunk;
+		this.#push(redacted);
+	}
 
+	#push(chunk: string): void {
+		const normalized = this.#normalizeCarriageReturns(chunk);
+		const sanitized = sanitizeWithOptionalSixelPassthrough(normalized, sanitizeText);
+		if (sanitized.length === 0) return;
+		chunk = sanitized;
 		// Throttled onChunk: coalesce chunks arriving inside the throttle window.
 		// A timer flushes quiet tails at the throttle boundary; dump() catches a
 		// final pending chunk when the process exits before that timer fires.
@@ -1214,16 +1230,17 @@ export class OutputSink {
 	 * branch in `dump()` against stale totals.
 	 */
 	replace(text: string): void {
+		const redacted = this.#captureWriter?.redactReplacement(text) ?? text;
 		this.#clearPendingChunkTimer();
-		this.#buffer = text;
-		this.#bufferBytes = Buffer.byteLength(text, "utf-8");
+		this.#buffer = redacted;
+		this.#bufferBytes = Buffer.byteLength(redacted, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
 		this.#headLines = 0;
 		this.#headRetentionDisabled = true;
 		this.#totalBytes = this.#bufferBytes;
-		this.#totalLines = countNewlines(text);
-		this.#sawData = text.length > 0;
+		this.#totalLines = countNewlines(redacted);
+		this.#sawData = redacted.length > 0;
 		this.#truncated = false;
 		this.#currentLineBytes = 0;
 		this.#columnEllipsisAdded = false;
@@ -1290,11 +1307,14 @@ export class OutputSink {
 			const headWritten = this.#artifactHeadBytesWritten;
 			const totalCapped = headWritten + this.#artifactTailIncomingBytes;
 			const headSep = headWritten > 0 ? "\n" : "";
-			const tailSep = tailBytes > 0 && !this.#artifactTailRing.startsWith("\n") ? "\n" : "";
+			const tailSep = tailBytes > 0 ? "\n" : "";
 			const notice =
 				`${headSep}[ARTIFACT TRUNCATED: kept first ${formatBytes(headWritten)} + last ${formatBytes(tailBytes)} ` +
 				`of ${formatBytes(totalCapped)}; ${formatBytes(droppedBytes)} elided from the middle]${tailSep}`;
-			this.#file.sink.write(notice);
+			const policy = getCapturePolicy();
+			if (!policy || Buffer.byteLength(notice, "utf8") <= policy.reserveBytes) {
+				this.#file.sink.write(notice);
+			}
 		}
 		if (tailBytes > 0) {
 			this.#file.sink.write(this.#artifactTailRing);
@@ -1302,6 +1322,8 @@ export class OutputSink {
 	}
 
 	async dump(notice?: string): Promise<OutputSummary> {
+		const finalCapture = this.#captureWriter?.finish();
+		if (finalCapture) this.#push(finalCapture);
 		if (this.#pendingCarriageReturn) {
 			this.#pendingCarriageReturn = false;
 			this.push(NL);

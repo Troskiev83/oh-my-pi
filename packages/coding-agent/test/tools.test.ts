@@ -10,6 +10,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { CaptureLimitError } from "@oh-my-pi/pi-coding-agent/session/capture-policy";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
@@ -1029,6 +1030,33 @@ describe("Coding Agent Tools", () => {
 				);
 				expect(getTextOutput(artifactResult)).toContain(line);
 				expect(saveArtifact).not.toHaveBeenCalled();
+			} finally {
+				await spillManager.close();
+			}
+		});
+
+		it("propagates a capture limit exhausted while spilling a large tool result", async () => {
+			const spillSettings = Settings.isolated({ "tools.artifactSpillThreshold": 20 });
+			const spillManager = SessionManager.create(testDir, path.join(testDir, "spill-capture-limit-sessions"));
+			await spillManager.ensureOnDisk();
+			const context = {
+				...createTestToolContext(["mcp__server__tool"]),
+				settings: spillSettings,
+				sessionManager: spillManager,
+			};
+			vi.spyOn(spillManager, "saveArtifact").mockRejectedValue(new CaptureLimitError("run"));
+			const tool = wrapToolWithMetaNotice({
+				name: "mcp__server__tool",
+				description: "large result fixture",
+				async execute() {
+					return { content: [{ type: "text" as const, text: "x".repeat(30 * 1024) }] };
+				},
+			} as unknown as AgentTool);
+
+			try {
+				await expect(tool.execute("spill-capture-limit", {}, undefined, undefined, context)).rejects.toMatchObject({
+					code: "CAPTURE_LIMIT_EXCEEDED",
+				});
 			} finally {
 				await spillManager.close();
 			}

@@ -42,6 +42,8 @@ export interface Args {
 	planYoloInto?: string;
 	maxTime?: number;
 	apiKey?: string;
+	/** Absolute path to an opt-in JSON capture policy. */
+	capturePolicy?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	thinking?: ConfiguredThinkingLevel;

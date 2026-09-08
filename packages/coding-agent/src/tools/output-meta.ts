@@ -18,6 +18,12 @@ import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
 import { formatBytes, wrapBrackets } from "./render-utils";
+import {
+	createCaptureWriter,
+	getCapturePolicy,
+	isCaptureLimitError,
+	redactCaptureValue,
+} from "../session/capture-policy";
 import { renderError } from "./tool-errors";
 
 /**
@@ -761,14 +767,14 @@ async function spillLargeResultToArtifact(
 	// Save the full output as an artifact so the elided bytes stay recoverable.
 	// In a persistent session this hits `Bun.write`, which can throw (disk full,
 	// permissions). The spill wraps arbitrary tools (built-in, MCP, extension,
-	// RPC-host); a save failure must never convert a successful call into an
-	// error, nor re-expose the full (possibly context-blowing) output. Mirror
-	// `enforceInlineByteCap`: always truncate past the threshold, and only
-	// attach the `artifact://` recovery link when the save actually succeeded.
+	// RPC-host). Ordinary storage failures still truncate without a recovery
+	// link, as in `enforceInlineByteCap`; a capture-policy violation must
+	// instead abort the invocation and retain its typed safety failure.
 	let artifactId: string | undefined;
 	try {
 		artifactId = await sessionManager.saveArtifact(fullText, toolName);
 	} catch (error) {
+		if (isCaptureLimitError(error)) throw error;
 		logger.warn("Failed to spill large tool result to artifact", {
 			tool: toolName,
 			error: error instanceof Error ? error.message : String(error),
@@ -894,6 +900,20 @@ async function spillLargeResultToArtifact(
 // Tool wrapper
 // =============================================================================
 
+function redactToolResultForCapture(result: AgentToolResult): AgentToolResult {
+	if (!getCapturePolicy()) return result;
+	const writer = createCaptureWriter();
+	const redact = (text: string): string => writer?.redactComplete(text) ?? text;
+	const content = result.content.map(block =>
+		block.type === "text" ? { ...block, text: redact(block.text) } : block,
+	);
+	const details =
+		result.details === undefined
+			? undefined
+			: (JSON.parse(redact(JSON.stringify(result.details))) as typeof result.details);
+	return { ...result, content, details };
+}
+
 async function wrappedExecute(
 	this: AgentTool & { [kUnwrappedExecute]: AgentToolExecFn },
 	toolCallId: string,
@@ -905,7 +925,9 @@ async function wrappedExecute(
 	const originalExecute = this[kUnwrappedExecute];
 
 	try {
-		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		let result = redactToolResultForCapture(
+			await originalExecute.call(this, toolCallId, params, signal, onUpdate, context),
+		);
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);
@@ -919,12 +941,12 @@ async function wrappedExecute(
 			};
 		}
 		return result;
-	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
-		throw new Error(renderError(e));
+	} catch (error) {
+		if (isCaptureLimitError(error)) throw error;
+		const message = renderError(error);
+		throw new Error(getCapturePolicy() ? redactCaptureValue(message) : message);
 	}
 }
-
 /**
  * Wrap a tool to:
  * 1. Automatically append output notices based on details.meta

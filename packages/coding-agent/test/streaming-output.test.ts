@@ -17,6 +17,7 @@ import {
 	truncateTailBytes,
 } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
 import { formatOutputNotice, outputMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { registerCaptureSecret, setCapturePolicy } from "@oh-my-pi/pi-coding-agent/session/capture-policy";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const createdTempDirs: string[] = [];
@@ -42,6 +43,7 @@ afterEach(async () => {
 	else Bun.env.PI_FORCE_IMAGE_PROTOCOL = originalForceProtocol;
 	if (originalAllowPassthrough === undefined) delete Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH;
 	else Bun.env.PI_ALLOW_SIXEL_PASSTHROUGH = originalAllowPassthrough;
+	setCapturePolicy(undefined);
 });
 
 describe("truncateTailBytes", () => {
@@ -726,6 +728,28 @@ describe("OutputSink head-retain mode", () => {
 		expect(dumped.output).toBe("abcdefgh");
 		expect(dumped.truncated).toBe(false);
 		expect(dumped.elidedBytes).toBeUndefined();
+	});
+
+	test("ignores pushes after finalization without a capture policy", async () => {
+		const sink = new OutputSink();
+		sink.push("before");
+		await sink.dump();
+		sink.push("after");
+
+		expect((await sink.dump()).output).toBe("before");
+	});
+
+	test("redacts and accounts minimizer replacements without reviving pre-replacement pending output", async () => {
+		setCapturePolicy({ version: 1, toolMaxBytes: 512, runMaxBytes: 1024, reserveBytes: 64 });
+		const secret = "synthetic-minimizer-secret";
+		registerCaptureSecret(secret);
+		const sink = new OutputSink();
+		sink.push("superseded stream output");
+		sink.replace(`minimized ${secret}`);
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toBe("minimized [REDACTED]");
+		expect(dumped.output).not.toContain(secret);
 	});
 
 	test("replace + push appends to tail and emits no elision marker", async () => {

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in `--capture-policy` for unattended sessions: per-tool and run-wide output ceilings, redaction before artifact/session persistence, and a startup receipt binding the active limits to the supplied policy.
+
+### Fixed
+
+- Protected capture sessions abort on output overflow, including artifact spills and minimized shell output, and stop their owned command process groups instead of continuing to append.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

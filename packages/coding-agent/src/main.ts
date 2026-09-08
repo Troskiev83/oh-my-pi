@@ -48,6 +48,14 @@ import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
 import { initializeWithSettings } from "./discovery";
 import {
+	capturePolicyReceipt,
+	loadCapturePolicy,
+	registerCaptureSecret,
+	setCapturePolicy,
+	setCapturePolicyViolationHandler,
+	type CapturePolicy,
+} from "./session/capture-policy";
+import {
 	clearPluginRootsAndCaches,
 	injectPluginDirRoots,
 	preloadPluginRoots,
@@ -1420,6 +1428,21 @@ export async function runRootCommand(
 		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
+		let capturePolicy: CapturePolicy | undefined;
+		if (parsedArgs.capturePolicy) {
+			capturePolicy = await loadCapturePolicy(parsedArgs.capturePolicy);
+			setCapturePolicy(capturePolicy);
+			setCapturePolicyViolationHandler(() => {
+				if (parsedArgs.mode === "json") {
+					process.stdout.write(
+						`${JSON.stringify({ type: "capture_policy_error", code: "CAPTURE_LIMIT_EXCEEDED" })}\n`,
+					);
+				}
+			});
+			if (parsedArgs.mode === "json") {
+				process.stdout.write(`${JSON.stringify(capturePolicyReceipt(capturePolicy))}\n`);
+			}
+		}
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 		} catch (error: unknown) {
@@ -1839,6 +1862,9 @@ export async function runRootCommand(
 			settingsInstance,
 		);
 		sessionOptions.authStorage = authStorage;
+		if (capturePolicy) {
+			sessionOptions.capturePolicy = capturePolicy;
+		}
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 		sessionOptions.settings = settingsInstance;
@@ -1862,6 +1888,7 @@ export async function runRootCommand(
 			}
 			if (sessionOptions.model) {
 				authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsedArgs.apiKey);
+				registerCaptureSecret(parsedArgs.apiKey);
 			}
 		}
 

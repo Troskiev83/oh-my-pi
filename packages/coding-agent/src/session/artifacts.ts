@@ -7,6 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceFileAtomically } from "../utils/atomic-file";
+import { redactCaptureValue } from "./capture-policy";
 
 /**
  * Sanitize a tool name for safe use as the middle segment of the artifact
@@ -42,10 +43,11 @@ function sanitizeToolType(toolType: string): string {
  * Returns the verified UTF-8 byte count.
  */
 export async function writeArtifact(path: string, content: string): Promise<number> {
-	const expectedBytes = Buffer.byteLength(content);
+	const redactedContent = redactCaptureValue(content);
+	const expectedBytes = Buffer.byteLength(redactedContent);
 	const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
 	try {
-		const writtenBytes = await Bun.write(tempPath, content);
+		const writtenBytes = await Bun.write(tempPath, redactedContent);
 		if (writtenBytes !== expectedBytes) {
 			throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
 		}

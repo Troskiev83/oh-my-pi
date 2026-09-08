@@ -594,8 +594,8 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * descendant that creates a new session and reparents to launchd.
 	 */
 	subreaper?: boolean;
-	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
-	stderr?: "full" | null;
+	/** Expose stderr as a stream. `full` additionally retains every byte for `wait()`. */
+	stderr?: "full" | "stream" | null;
 };
 
 function spawnInternal<In extends InMask = InMask>(
@@ -622,7 +622,13 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(
+		child,
+		stderr === "full" || stderr === "stream",
+		retainFullStderr,
+		detached === true,
+		useSubreaper,
+	);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;
