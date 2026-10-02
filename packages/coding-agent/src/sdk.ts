@@ -5236,15 +5236,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if (agentKind === "main" && registeredAgentRef) {
 			const releaseCwd = sessionManager.getCwd();
 			const releaseSessionId = sessionManager.getSessionId();
-			worktreeRelease = await publishWorktreeRelease({
-				cwd: releaseCwd,
-				sessionId: releaseSessionId,
-				isCurrent: () =>
-					sessionManager.getCwd() === releaseCwd && sessionManager.getSessionId() === releaseSessionId,
-				owner: registeredAgentRef,
-				registry: agentRegistry,
-				lifecycle: agentLifecycle,
-			});
+			try {
+				worktreeRelease = await publishWorktreeRelease({
+					cwd: releaseCwd,
+					sessionId: releaseSessionId,
+					isCurrent: () =>
+						sessionManager.getCwd() === releaseCwd && sessionManager.getSessionId() === releaseSessionId,
+					owner: registeredAgentRef,
+					registry: agentRegistry,
+					lifecycle: agentLifecycle,
+				});
+			} catch (error) {
+				logger.warn("Worktree release control unavailable; external closeout remains blocked", { error });
+			}
 		}
 
 		startupCleanup.move();

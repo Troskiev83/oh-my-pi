@@ -717,6 +717,31 @@ describe("AgentLifecycleManager", () => {
 		expect(lifecycle.has("8-Sub")).toBe(true);
 	});
 
+	for (const killFirst of [false, true]) {
+		it(`concurrent kill and teardown preserve the kill across restart when ${killFirst ? "kill" : "teardown"} starts first`, async () => {
+			using tempDir = TempDir.createSync("@omp-concurrent-release-");
+			const rootSessionFile = path.join(tempDir.path(), "main.jsonl");
+			const workerId = "Concurrent-Killed";
+			const workerSessionFile = path.join(tempDir.path(), "main", `${workerId}.jsonl`);
+			await Bun.write(rootSessionFile, "");
+			await Bun.write(workerSessionFile, "");
+			const gate = deferred();
+			const stub = makeSessionStub(() => gate.promise);
+			const ref = registerIdleSub(workerId, stub.session, workerSessionFile);
+			const first = lifecycle.release(workerId, ref, { tombstone: killFirst });
+			const second = lifecycle.release(workerId, ref, { tombstone: !killFirst });
+			gate.resolve();
+			expect(await Promise.all([first, second])).toEqual([true, true]);
+			expect(stub.disposeCalls()).toBe(1);
+			expect(registry.get(workerId)).toMatchObject({ status: "aborted", session: null });
+			await expect(lifecycle.ensureLive(workerId)).rejects.toThrow(/aborted/);
+			expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(true);
+			const restored = new AgentRegistry();
+			await registerPersistedSubagents(restored, rootSessionFile);
+			expect(restored.get(workerId)?.status).toBe("aborted");
+		});
+	}
+
 	it("tombstone release keeps a killed ref as terminal `aborted` so a persisted-subagent rescan cannot resurrect it as parked", async () => {
 		using tempDir = TempDir.createSync("@omp-lifecycle-tombstone-");
 		const rootSessionFile = path.join(tempDir.path(), "main.jsonl");

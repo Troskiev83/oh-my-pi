@@ -10,6 +10,7 @@
 
 - Fixed kept-alive isolation cleanup reporting success after failed capture or backend teardown. Late edits are preserved in distinct recovery artifacts, and failed release prevents origin teardown.
 - Fixed SDK disposal using process-global lifecycle ownership instead of the session's own registry and descendants.
+- Fixed concurrent descendant teardown dropping explicit-kill tombstones, and main-session startup failing when private closeout control could not be published.
 
 ## [18.4.10] - 2026-10-02
 

@@ -10,12 +10,13 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { requestWorktreeRelease } from "@oh-my-pi/pi-coding-agent/registry/worktree-release";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { getBaseConfigRoot, getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
 function createTtsrRule(name: string): Rule {
@@ -114,6 +115,43 @@ describe("createAgentSession session storage isolation", () => {
 		for (const tempDir of tempDirs.splice(0)) {
 			removeSyncWithRetries(tempDir);
 		}
+	});
+
+	it("starts without a closeout endpoint when its runtime directory is unsafe, but refuses external teardown", async () => {
+		await withTempConfigRoot(async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-sdk-release-unavailable-"));
+			tempDirs.push(tempDir);
+			const runtimeDir = path.join(getBaseConfigRoot(), "run", "worktree-release");
+			const targetDir = path.join(tempDir, "runtime-target");
+			fs.mkdirSync(path.dirname(runtimeDir), { recursive: true });
+			fs.mkdirSync(targetDir);
+			fs.symlinkSync(targetDir, runtimeDir, "dir");
+			const registry = new AgentRegistry();
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: path.join(tempDir, "agent"),
+				modelRegistry: sharedModelRegistry,
+				agentRegistry: registry,
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			try {
+				expect(registry.get("Main")?.session).toBe(session);
+				await expect(requestWorktreeRelease({ pid: process.pid, cwd: tempDir, check: true })).rejects.toThrow(
+					"Unsafe worktree release runtime path",
+				);
+				expect(fs.readdirSync(targetDir)).toEqual([]);
+				expect(fs.existsSync(tempDir)).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+		});
 	});
 
 	it("uses the provided agentDir for the default persistent session root", async () => {

@@ -71,6 +71,12 @@ interface AdoptedAgent {
 	timer?: NodeJS.Timeout;
 }
 
+interface ReleasingAgent {
+	promise: Promise<boolean>;
+	tombstone: boolean;
+	tombstonePersistence?: Promise<void>;
+}
+
 interface ParkInFlight {
 	/** The exact ref this park was started for. */
 	ref: AgentRef;
@@ -152,7 +158,7 @@ export class AgentLifecycleManager {
 	readonly #parks = new Map<string, ParkInFlight>();
 	/** In-flight revives, bound to the parked ref that initiated them, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #revivals = new Map<string, RevivingAgent>();
-	readonly #releases = new WeakMap<AgentRef, Promise<boolean>>();
+	readonly #releases = new WeakMap<AgentRef, ReleasingAgent>();
 	readonly #disposals = new WeakMap<AgentRef, { session: AgentSession; promise: Promise<void> }>();
 
 	#rememberDisposal(ref: AgentRef, session: AgentSession): Promise<void> {
@@ -562,26 +568,48 @@ export class AgentLifecycleManager {
 	): Promise<boolean> {
 		const ref = options?.strict && expected && "kind" in expected ? expected : this.#registry.get(id);
 		if (ref && (expected === undefined || ref === expected || ref.session === expected)) {
+			const live = ref.session;
 			let release = this.#releases.get(ref);
+			let completion: PromiseWithResolvers<boolean> | undefined;
 			if (!release) {
-				release = this.#release(id, expected, options);
+				completion = Promise.withResolvers<boolean>();
+				release = { promise: completion.promise, tombstone: false };
 				this.#releases.set(ref, release);
 			}
-			const released = await release;
-			if (released && !options?.tombstone) this.#registry.unregister(id, ref);
+			if (options?.tombstone && !release.tombstone) {
+				release.tombstone = true;
+				// A kill dominates ordinary teardown. Publish the terminal, detached
+				// ref before any await or dispose hook can unregister it (#10531).
+				if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
+					logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
+				}
+				if (ref.sessionFile) {
+					release.tombstonePersistence = persistAgentTombstone(ref.sessionFile);
+					void release.tombstonePersistence.catch(error => this.#failures.set(ref, error));
+				}
+			}
+			if (completion) {
+				void this.#release(id, ref, release, live).then(completion.resolve, completion.reject);
+			}
+			const released = await release.promise;
+			await release.tombstonePersistence;
+			if (released && !release.tombstone) this.#registry.unregister(id, ref);
 			if (options?.strict && this.#failures.has(ref)) throw this.#failures.get(ref);
 			return released;
 		}
 		return false;
 	}
 
-	async #release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
+	async #release(
+		id: string,
+		expected: AgentRef,
+		release: ReleasingAgent,
+		live: AgentSession | null,
+	): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
 		const current = this.#registry.get(id);
-		const currentMatches =
-			current && (expected === undefined || current === expected || current.session === expected);
-		const adoptedMatches =
-			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
+		const currentMatches = current === expected;
+		const adoptedMatches = adopted?.ref === expected;
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
 		const onRelease = adopted && adopted.ref === ref ? adopted.onRelease : undefined;
 		if (!ref) return false;
@@ -597,26 +625,8 @@ export class AgentLifecycleManager {
 			await park.promise;
 		}
 
-		const live = this.#registry.get(id) === ref ? ref.session : null;
-		if (options?.tombstone) {
-			// Apply the terminal transition synchronously, before any await. The
-			// dying session's own dispose path calls unregisterUnlessParked
-			// (sdk.ts), which spares a ref only when it is already `aborted` AND
-			// already detached; awaiting persistAgentTombstone before this
-			// transition left a window in which that unregister deleted the ref
-			// (issue #10531). Persisting the sidecar afterward is safe: within the
-			// process the still-registered `aborted` row already blocks re-adoption
-			// via the `if (!registry.get(id))` discovery guard, and the sidecar
-			// only needs to exist before a later cross-restart discovery pass —
-			// release awaits the write below before returning.
-			// Detach before publishing `aborted`: setStatus emits synchronously, so
-			// every subscriber must observe a terminal ref with session === null.
-			if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
-				logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
-			}
-		}
 		try {
-			if (options?.tombstone && ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
+			await release.tombstonePersistence;
 		} finally {
 			// Detaching removes the registry's only route to the live session. Always
 			// dispose the captured session, even when tombstone persistence fails.
@@ -648,7 +658,6 @@ export class AgentLifecycleManager {
 				});
 			}
 		}
-		if (!options?.tombstone) this.#registry.unregister(id, ref);
 		return true;
 	}
 
