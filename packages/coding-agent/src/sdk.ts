@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { publishWorktreeRelease } from "./registry/worktree-release";
 import {
 	Agent,
 	type AgentEvent,
@@ -1613,11 +1614,19 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	registerLocalInferenceApi();
-	const extensionRoots = options.extensionRoots?.();
-	const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
-	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
-	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
+	const child = (options.taskDepth ?? 0) > 0 || Boolean(options.parentTaskPrefix);
+	const settle = child
+		? (options.agentRegistry ?? AgentRegistry.global()).beginTask(options.parentAgentId ?? MAIN_AGENT_ID)
+		: undefined;
+	try {
+		registerLocalInferenceApi();
+		const extensionRoots = options.extensionRoots?.();
+		const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
+		const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
+		return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
+	} finally {
+		settle?.();
+	}
 }
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
@@ -2109,6 +2118,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	const agentLifecycle = AgentLifecycleManager.forRegistry(agentRegistry);
+	let worktreeRelease: { close(): Promise<void> } | undefined;
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
 	let registeredAgentRef: AgentRef | undefined;
@@ -2126,7 +2137,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const ref = registeredAgentRef;
 		if (!ref || agentRegistry.get(resolvedAgentId) !== ref) return;
 		if (ref.status === "parked" || (ref.status === "aborted" && !ref.session)) return;
-		if (AgentLifecycleManager.global().isParking(resolvedAgentId, ref)) return;
+		if (agentLifecycle.isParking(resolvedAgentId, ref)) return;
 		agentRegistry.unregister(resolvedAgentId, ref);
 	};
 	const evalKernelOwnerId = `agent-session:${Snowflake.next()}`;
@@ -2227,11 +2238,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
 			getCodeModeDirectToolNames: () => session?.getCodeModeDirectToolNames(),
 			agentRegistry,
-			// The global lifecycle releases through AgentRegistry.global(); wiring it
-			// onto a caller-supplied registry would report a cancel while releasing an
-			// unrelated global ref. With no lifecycle, explicit cancellation falls back to
-			// dispose + unregister on the session's own registry.
-			agentLifecycle: options.agentRegistry ? undefined : () => AgentLifecycleManager.global(),
+			agentLifecycle: () => agentLifecycle,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getSessionAgents: () => session?.getSessionAgents() ?? [],
 			advertisedSessionAgents: () => session?.getAdvertisedSessionAgents() ?? [],
@@ -3970,15 +3977,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
 			kind: agentKind,
-			parentId: options.parentAgentId,
+			parentId: options.parentAgentId ?? (agentKind === "sub" ? MAIN_AGENT_ID : undefined),
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,
 			status: "running" as const,
 		};
 		registeredAgentRef =
-			options.expectedAgentRef === undefined
+			options.expectedAgentRef === undefined && agentKind !== "main"
 				? agentRegistry.register(registrationInput)
-				: agentRegistry.registerIfAvailable(registrationInput, options.expectedAgentRef);
+				: agentRegistry.registerIfAvailable(registrationInput, options.expectedAgentRef ?? null);
 		if (!registeredAgentRef && options.expectedAgentRef === null) {
 			// A fresh spawn collided with an existing id. If that id is held by a
 			// provably-dead parked corpse — no live session, no reviver — reclaim it
@@ -3988,7 +3995,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// The reclaim is gated by the lifecycle owner and only touches the
 			// registry it manages; the corpse's transcript stays at history://.
 			const stale = agentRegistry.get(resolvedAgentId);
-			const lifecycle = AgentLifecycleManager.global();
+			const lifecycle = agentLifecycle;
 			if (stale && lifecycle.manages(agentRegistry) && (await lifecycle.reclaimDeadCorpse(resolvedAgentId, stale))) {
 				registeredAgentRef = agentRegistry.registerIfAvailable(registrationInput, null);
 			}
@@ -4878,11 +4885,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// begins — the lifecycle await below opens an async gap before
 					// AgentSession.dispose() would otherwise set its guards.
 					session.beginDispose();
+					await worktreeRelease?.close();
 					if (agentKind === "main") {
-						// Top-level teardown owns the global agent lifecycle: park timers,
-						// adopted subagent sessions, revivers. Tear it down while shared
-						// resources (kernels, MCP, LSP) are still live. Subagent disposal
-						// must NOT touch the global lifecycle.
+						// Dispose only this main generation's descendants while its
+						// shared resources remain live; other SDK roots are independent.
 						const vibeRegistry = VibeSessionRegistry.global();
 						const vibeParentSession = {
 							getAgentId: () => resolvedAgentId,
@@ -4894,7 +4900,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							getActiveModelString,
 						};
 						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
-						await AgentLifecycleManager.global().dispose();
+						if (registeredAgentRef) await agentLifecycle.disposeDescendants(registeredAgentRef);
 					}
 					await originalDispose();
 				} finally {
@@ -5225,6 +5231,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			await session.initializeCodeMode();
 		} catch (error) {
 			logger.warn("Code Mode initialization at session startup failed", { error: String(error) });
+		}
+
+		if (agentKind === "main" && registeredAgentRef) {
+			const releaseCwd = sessionManager.getCwd();
+			const releaseSessionId = sessionManager.getSessionId();
+			worktreeRelease = await publishWorktreeRelease({
+				cwd: releaseCwd,
+				sessionId: releaseSessionId,
+				isCurrent: () =>
+					sessionManager.getCwd() === releaseCwd && sessionManager.getSessionId() === releaseSessionId,
+				owner: registeredAgentRef,
+				registry: agentRegistry,
+				lifecycle: agentLifecycle,
+			});
 		}
 
 		startupCleanup.move();

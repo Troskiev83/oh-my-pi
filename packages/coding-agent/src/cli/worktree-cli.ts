@@ -23,10 +23,28 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
+import { requestWorktreeRelease, type WorktreeReleaseOptions } from "../registry/worktree-release";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
+
+/** Print a truthful native receipt before an external caller may invalidate the origin. */
+export async function releaseWorktree(options: WorktreeReleaseOptions & { json?: boolean }): Promise<void> {
+	try {
+		const receipt = await requestWorktreeRelease(options);
+		console.log(
+			options.json
+				? JSON.stringify(receipt)
+				: `${options.check ? "Ready" : "Released"}: ${receipt.cwd} (session ${receipt.session_id})`,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (options.json) console.log(JSON.stringify({ ready: false, released: false, error: message }));
+		else console.error(message);
+		process.exitCode = 1;
+	}
+}
 
 type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
 

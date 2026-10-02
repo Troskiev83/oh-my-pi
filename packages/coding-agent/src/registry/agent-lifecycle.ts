@@ -91,6 +91,17 @@ interface RevivingAgent {
 
 export class AgentLifecycleManager {
 	static #global: AgentLifecycleManager | undefined;
+	static readonly #privateManagers = new WeakMap<AgentRegistry, AgentLifecycleManager>();
+
+	static forRegistry(registry: AgentRegistry): AgentLifecycleManager {
+		if (registry === AgentRegistry.global()) return AgentLifecycleManager.global();
+		let manager = AgentLifecycleManager.#privateManagers.get(registry);
+		if (!manager || manager.#disposed) {
+			manager = new AgentLifecycleManager(registry);
+			AgentLifecycleManager.#privateManagers.set(registry, manager);
+		}
+		return manager;
+	}
 
 	static global(): AgentLifecycleManager {
 		const current = AgentLifecycleManager.#global;
@@ -141,6 +152,92 @@ export class AgentLifecycleManager {
 	readonly #parks = new Map<string, ParkInFlight>();
 	/** In-flight revives, bound to the parked ref that initiated them, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #revivals = new Map<string, RevivingAgent>();
+	readonly #releases = new WeakMap<AgentRef, Promise<boolean>>();
+	readonly #disposals = new WeakMap<AgentRef, { session: AgentSession; promise: Promise<void> }>();
+
+	#rememberDisposal(ref: AgentRef, session: AgentSession): Promise<void> {
+		const prior = this.#disposals.get(ref);
+		if (prior?.session === session) return prior.promise;
+		const promise = session.settleDispose?.() ?? Promise.resolve();
+		this.#disposals.set(ref, { session, promise });
+		void promise.catch(error => this.#failures.set(ref, error));
+		return promise;
+	}
+	readonly #failures = new WeakMap<AgentRef, unknown>();
+	readonly #scopeReleases = new WeakMap<AgentRef, Promise<string[]>>();
+	readonly #scopeFailures = new WeakMap<AgentRef, unknown>();
+
+	/** Read-only: parks may finish during apply; revivals are admitted task work. */
+	checkRelease(owner: AgentRef): void {
+		this.#registry.assertReleaseReady(owner);
+		if (this.#scopeFailures.has(owner)) throw this.#scopeFailures.get(owner);
+		for (const ref of this.#registry.ownedDescendants(owner)) {
+			if (this.#revivals.get(ref.id)?.ref === ref) {
+				throw new Error(`Child agent "${ref.id}" is reviving.`);
+			}
+			if (this.#failures.has(ref)) throw this.#failures.get(ref);
+		}
+	}
+
+	/** Seal synchronously, await real disposal and capture, remember every failed attempt. */
+	releaseDescendants(owner: AgentRef, deadlineAt: number): Promise<string[]> {
+		const existing = this.#scopeReleases.get(owner);
+		if (existing) {
+			return untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => existing).then(
+				ids => {
+					if (this.#scopeFailures.has(owner)) throw this.#scopeFailures.get(owner);
+					return ids;
+				},
+				error => {
+					this.#scopeFailures.set(owner, error);
+					throw error;
+				},
+			);
+		}
+		this.#registry.sealDescendants(owner);
+		let release: Promise<string[]>;
+		try {
+			this.checkRelease(owner);
+			const refs = this.#registry.ownedDescendants(owner);
+			const settled = Promise.allSettled(refs.map(ref => this.release(ref.id, ref, { strict: true })));
+			release = untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), async () => {
+				const results = await settled;
+				const failed = results.find(result => result.status === "rejected");
+				if (failed?.status === "rejected") throw failed.reason;
+				if (this.#scopeFailures.has(owner)) throw this.#scopeFailures.get(owner);
+				return refs
+					.filter((_, index) => {
+						const result = results[index];
+						return result.status === "fulfilled" && result.value;
+					})
+					.map(ref => ref.id);
+			});
+		} catch (error) {
+			release = Promise.reject(error);
+		}
+		release = release.catch(error => {
+			this.#scopeFailures.set(owner, error);
+			throw error;
+		});
+		this.#scopeReleases.set(owner, release);
+		return release;
+	}
+
+	/** Normal shutdown keeps its best-effort deadline, but never touches another root. */
+	async disposeDescendants(owner: AgentRef, deadlineAt = Date.now() + AGENT_RELEASE_GRACE_MS): Promise<void> {
+		this.#registry.sealDescendants(owner);
+		await Promise.all(
+			this.#registry.ownedDescendants(owner).map(async ref => {
+				const release = this.release(ref.id, ref).then(() => {});
+				try {
+					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
+				} catch (error) {
+					trackLateCleanup(release, { id: ref.id, resource: "adopted-agent" });
+					logger.warn("Agent cleanup exceeded its deadline", { id: ref.id, error: String(error) });
+				}
+			}),
+		);
+	}
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
@@ -317,7 +414,10 @@ export class AgentLifecycleManager {
 				try {
 					await session.dispose();
 				} catch (error) {
+					this.#failures.set(ref, error);
 					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
+				} finally {
+					this.#rememberDisposal(ref, session);
 				}
 			} finally {
 				// Only clear if we are still the in-flight entry (a later park would
@@ -339,6 +439,16 @@ export class AgentLifecycleManager {
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
 	async ensureLive(id: string): Promise<AgentSession> {
+		const settle = this.#registry.beginTask(id);
+		try {
+			return await this.#ensureLiveAdmitted(id);
+		} finally {
+			settle();
+		}
+	}
+
+	async #ensureLiveAdmitted(id: string): Promise<AgentSession> {
+		this.#registry.assertAdmission(id);
 		const park = this.#parks.get(id);
 		if (park) {
 			const parked = this.#registry.get(id);
@@ -346,6 +456,7 @@ export class AgentLifecycleManager {
 			// thrashing dispose + revive.
 			if (parked?.session && !park.detached && park.cancel()) {
 				await park.promise;
+				this.#registry.assertAdmission(id);
 				const kept = this.#registry.get(id)?.session;
 				if (kept) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
@@ -357,6 +468,7 @@ export class AgentLifecycleManager {
 				// Already committed to detach (or no live session): wait for park,
 				// then fall through to the revive path.
 				await park.promise;
+				this.#registry.assertAdmission(id);
 			}
 		}
 
@@ -365,6 +477,11 @@ export class AgentLifecycleManager {
 			throw new Error(
 				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
+		}
+		const disposal = this.#disposals.get(ref);
+		if (disposal) {
+			await disposal.promise;
+			this.#registry.assertAdmission(id);
 		}
 		if (ref.session) return ref.session;
 		const inflight = this.#revivals.get(id);
@@ -438,7 +555,27 @@ export class AgentLifecycleManager {
 	 * on-disk transcript as a fresh `parked` row. Mirrors
 	 * `finalizeSubagentLifecycle`'s genuine-kill path.
 	 */
-	async release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
+	async release(
+		id: string,
+		expected?: AgentRefExpectation,
+		options?: { tombstone?: boolean; strict?: boolean },
+	): Promise<boolean> {
+		const ref = options?.strict && expected && "kind" in expected ? expected : this.#registry.get(id);
+		if (ref && (expected === undefined || ref === expected || ref.session === expected)) {
+			let release = this.#releases.get(ref);
+			if (!release) {
+				release = this.#release(id, expected, options);
+				this.#releases.set(ref, release);
+			}
+			const released = await release;
+			if (released && !options?.tombstone) this.#registry.unregister(id, ref);
+			if (options?.strict && this.#failures.has(ref)) throw this.#failures.get(ref);
+			return released;
+		}
+		return false;
+	}
+
+	async #release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
 		const current = this.#registry.get(id);
 		const currentMatches =
@@ -487,12 +624,24 @@ export class AgentLifecycleManager {
 				try {
 					await live.dispose();
 				} catch (error) {
+					this.#failures.set(ref, error);
 					logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
 				}
+				this.#rememberDisposal(ref, live);
+			}
+			try {
+				await this.#disposals.get(ref)?.promise;
+			} catch (error) {
+				this.#failures.set(ref, error);
+				logger.warn("AgentLifecycleManager.release: session cleanup did not settle cleanly", {
+					id,
+					error: String(error),
+				});
 			}
 			try {
 				await onRelease?.();
 			} catch (error) {
+				this.#failures.set(ref, error);
 				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
 					id,
 					error: String(error),
@@ -533,6 +682,12 @@ export class AgentLifecycleManager {
 
 	async #revive(id: string, revive: AgentReviver, ref: AgentRef, adopted: AdoptedAgent): Promise<AgentSession> {
 		const session = await revive(ref);
+		try {
+			this.#registry.assertAdmission(id);
+		} catch (error) {
+			await session.dispose();
+			throw error;
+		}
 		if (this.#disposed) {
 			// The owning lifecycle tore down while the reviver was in flight; dispose
 			// the freshly built session instead of attaching it, and fail the waiter.

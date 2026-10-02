@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `omp worktree release --pid <owner> --cwd <worktree> --json`, with a read-only `--check`, to prove scoped descendant release before origin teardown.
+
+### Fixed
+
+- Fixed kept-alive isolation cleanup reporting success after failed capture or backend teardown. Late edits are preserved in distinct recovery artifacts, and failed release prevents origin teardown.
+- Fixed SDK disposal using process-global lifecycle ownership instead of the session's own registry and descendants.
+
 ## [18.4.10] - 2026-10-02
 
 ### Added

@@ -15,7 +15,6 @@ import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
@@ -334,41 +333,6 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 		expect(registry.get("revived-worker")).toBeUndefined();
-	});
-
-	it("suspends the exact Vibe owner scope before global lifecycle teardown", async () => {
-		VibeSessionRegistry.resetGlobalForTests();
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-vibe-dispose-${Snowflake.next()}-`));
-		tempDirs.push(tempDir);
-		const cwd = path.join(tempDir, "project");
-		fs.mkdirSync(cwd, { recursive: true });
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir: path.join(tempDir, "agent"),
-			modelRegistry: sharedModelRegistry,
-			settings: Settings.isolated(),
-			disableExtensionDiscovery: true,
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-		});
-		const vibeRegistry = VibeSessionRegistry.global();
-		const suspend = vi.spyOn(vibeRegistry, "suspendScope");
-		const lifecycleDispose = vi.spyOn(AgentLifecycleManager.global(), "dispose");
-		const parentSessionId = session.sessionManager.getSessionId();
-		const parentSessionFile = session.sessionManager.getSessionFile();
-		if (!parentSessionFile) throw new Error("Expected persisted parent session file");
-
-		await session.dispose();
-
-		expect(suspend).toHaveBeenCalledWith(
-			{ ownerId: "Main", parentSessionId, parentSessionFile },
-			session.asyncJobManager,
-		);
-		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
 	});
 
 	it("wires the discovered TTSR manager into the created session", async () => {

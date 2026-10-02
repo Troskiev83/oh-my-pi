@@ -397,6 +397,7 @@ export class WorkPool {
 						result = execution.result;
 					} else {
 						result = await runSubagentFollowUpTurn({
+							agentRegistry: this.session.agentRegistry,
 							id: agent.id,
 							agent: this.policy.agent,
 							message,
@@ -438,7 +439,8 @@ export class WorkPool {
 		for (const item of batch.items) item.status = batch.status;
 		agent.turns++;
 		agent.jobId = undefined;
-		const ref = AgentRegistry.global().get(agent.id);
+		const registry = this.session.agentRegistry ?? AgentRegistry.global();
+		const ref = registry.get(agent.id);
 		// Retained idle workers can wake through IRC, so clear the runtime schema and cached inline declaration together.
 		// A refresh failure must not strand the pool in #waitForDrain(): items are
 		// already terminal, so keep the turn result, drop the worker instead of
@@ -464,7 +466,7 @@ export class WorkPool {
 			// declaration and an empty runtime set.
 			if (ref) {
 				try {
-					await AgentLifecycleManager.global().release(agent.id, ref, { tombstone: true });
+					await AgentLifecycleManager.forRegistry(registry).release(agent.id, ref, { tombstone: true });
 				} catch (releaseError) {
 					logger.warn("workpool: failed to release worker after yield clear failure", {
 						pool: this.name,
@@ -607,7 +609,9 @@ export class WorkPool {
 			timestamp,
 		};
 		try {
-			AgentRegistry.global().get(this.ownerId)?.session?.emitIrcRelayObservation(record);
+			(this.session.agentRegistry ?? AgentRegistry.global())
+				.get(this.ownerId)
+				?.session?.emitIrcRelayObservation(record);
 		} catch (error) {
 			logger.debug("workpool: card emission failed", {
 				pool: this.name,

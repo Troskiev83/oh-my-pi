@@ -300,6 +300,10 @@ During asynchronous disposal, the session records and synchronously flushes its 
 
 Only after work capable of appending session entries has settled does disposal clean up an empty moved session, close the `SessionManager`, close provider session state, disconnect the agent, and remove listeners. A failure from the final persistence cleanup or `SessionManager.close()` rejects the shared disposal promise; individual provider-session close failures are logged.
 
+Top-level SDK sessions publish a private local control endpoint tied to their PID, canonical working directory, and session identity. `omp worktree release --pid <owner> --cwd <worktree> --json --check` checks readiness without releasing descendants. Omit `--check` to seal task admission and release only that session's descendants before deleting its working directory. Running tasks, unknown owners, ambiguous sessions, capture failures, and expired deadlines return failure; callers must keep the origin intact.
+
+Release waits for pending parking and captures any isolated changes made after the last yielded result into a distinct patch and recovery branch. It does not rewrite the earlier yielded artifacts or apply changes to the origin. Failed capture retains a recoverable isolation directory. `await session.dispose()` uses the session's registry and lifecycle owner rather than disposing unrelated sessions in the process.
+
 ## Tools and extension integration
 
 ### Built-ins and filtering

@@ -18,6 +18,7 @@
  *
  * Step 1 happens once per top-level call; steps 2 and 3 are per-spawn.
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
@@ -26,7 +27,7 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import isolationErrorTemplate from "../prompts/tools/isolation-error.md" with { type: "text" };
 import isolationSummaryTemplate from "../prompts/tools/isolation-summary.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -42,6 +43,7 @@ import {
 	cleanupTaskBranches,
 	type CommitToBranchResult,
 	commitToBranch,
+	type DeltaPatchResult,
 	ensureIsolation,
 	getRepoRoot,
 	type IsolationHandle,
@@ -82,17 +84,6 @@ export interface IsolationSummaryContext {
  */
 export function renderIsolationSummary(context: IsolationSummaryContext): string {
 	return `\n\n${prompt.render(isolationSummaryTemplate, { ...context })}`;
-}
-
-/** Record artifact locations for `agent://` and mark the result as an isolated run. */
-function rememberAgentArtifacts(result: SingleResult): SingleResult {
-	AgentRegistry.global().setHistory(result.id, {
-		outputPath: result.outputPath,
-		patchPath: result.patchPath,
-		branchName: result.branchName,
-		nestedPatchPaths: result.nestedPatchPaths,
-	});
-	return { ...result, isolated: true };
 }
 
 /**
@@ -267,8 +258,9 @@ async function writeIsolationPatch(
 	baseline: WorktreeBaseline,
 	artifactsDir: string,
 	agentId: string,
+	captured?: DeltaPatchResult,
 ): Promise<IsolationPatchCapture> {
-	const delta = await captureDeltaPatch(isolationDir, baseline);
+	const delta = captured ?? (await captureDeltaPatch(isolationDir, baseline));
 	const patchPath = path.join(artifactsDir, `${agentId}.patch`);
 	await Bun.write(patchPath, delta.rootPatch);
 	const nestedPatchPaths = await persistNestedPatches(artifactsDir, agentId, delta.nestedPatches);
@@ -381,6 +373,51 @@ function renderIsolationError(context: IsolationErrorContext): string {
  * sibling and its path is named in the resulting error.
  */
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
+	const registry = opts.baseOptions.agentRegistry ?? AgentRegistry.global();
+	const settle = registry.beginTask(opts.baseOptions.parentAgentId ?? MAIN_AGENT_ID);
+	let pendingCleanup: Promise<void> | undefined;
+	let captureFailure: Error | undefined;
+	try {
+		return await runIsolatedSubprocessAdmitted(
+			opts,
+			completion => {
+				pendingCleanup = completion;
+			},
+			error => {
+				captureFailure = error;
+			},
+		);
+	} finally {
+		if (pendingCleanup)
+			void pendingCleanup.then(
+				() => settle(captureFailure),
+				error => settle(error),
+			);
+		else settle(captureFailure);
+	}
+}
+
+async function runIsolatedSubprocessAdmitted(
+	opts: IsolatedRunOptions,
+	onCleanupDeferred: (completion: Promise<void>) => void,
+	onCaptureFailure: (error: Error) => void,
+): Promise<SingleResult> {
+	const registry = opts.baseOptions.agentRegistry ?? AgentRegistry.global();
+	const lifecycle = AgentLifecycleManager.forRegistry(registry);
+	let captureFailure: Error | undefined;
+	const rememberAgentArtifacts = (result: SingleResult): SingleResult => {
+		if (retainWorkspace && result.error) {
+			captureFailure = new Error(result.error);
+			onCaptureFailure(captureFailure);
+		}
+		registry.setHistory(result.id, {
+			outputPath: result.outputPath,
+			patchPath: result.patchPath,
+			branchName: result.branchName,
+			nestedPatchPaths: result.nestedPatchPaths,
+		});
+		return { ...result, isolated: true };
+	};
 	let taskBaseline: WorktreeBaseline | undefined;
 	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
 	let handedOff: bigint | number | undefined;
@@ -394,23 +431,30 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		baseReleasePromise ??= opts.baseOptions.onRelease?.() ?? Promise.resolve();
 		return baseReleasePromise;
 	};
-	const cleanupHandle = (): Promise<void> => {
+	const cleanupHandle = (strict = false): Promise<void> => {
 		cleanupPromise ??= (async () => {
 			await releaseBase();
-			if (handle && !retainWorkspace) await cleanupIsolation(handle);
+			if (handle && !retainWorkspace) await cleanupIsolation(handle, { strict });
 		})();
 		return cleanupPromise;
 	};
 	const releaseIsolation = (): Promise<void> => {
 		releasePromise ??= (async () => {
+			if (captureFailure) {
+				await cleanupHandle(true);
+				throw captureFailure;
+			}
 			if (!handle || !taskBaseline || retainWorkspace) {
-				await cleanupHandle();
+				await cleanupHandle(true);
 				return;
 			}
 			try {
 				let capture: IsolationPatchCapture;
+				const releaseId = `${opts.agentId}-release-${crypto.randomBytes(6).toString("hex")}`;
 				try {
-					capture = await writeIsolationPatch(handle.mergedDir, taskBaseline, opts.artifactsDir, opts.agentId);
+					const delta = await captureDeltaPatch(handle.mergedDir, taskBaseline);
+					if (deltaFingerprint(delta.rootPatch, delta.nestedPatches) === handedOff) return;
+					capture = await writeIsolationPatch(handle.mergedDir, taskBaseline, opts.artifactsDir, releaseId, delta);
 				} catch (captureErr) {
 					retainWorkspace = true;
 					const retained = await retainIsolationWorkspace(handle.mergedDir, handle.backend);
@@ -424,27 +468,24 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					);
 				}
 				const patchResult = capture.artifacts;
-				AgentRegistry.global().setHistory(opts.agentId, {
+				registry.setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
 				});
-				// Nothing changed since the run-end capture the caller already
-				// merged or applied: a branch now would only duplicate that work.
-				if (capture.fingerprint === handedOff) return;
 				const commitResult = await commitToBranch(
 					handle.mergedDir,
 					taskBaseline,
-					opts.agentId,
+					releaseId,
 					opts.description,
 					undefined,
 				);
-				AgentRegistry.global().setHistory(opts.agentId, {
+				registry.setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					branchName: commitResult?.branchName,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
 				});
 			} finally {
-				await cleanupHandle();
+				await cleanupHandle(true);
 			}
 		})();
 		return releasePromise;
@@ -587,10 +628,12 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			handle &&
 			!retainWorkspace &&
 			!releasePromise &&
-			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
+			!(opts.baseOptions.keepAlive !== false && lifecycle.has(opts.agentId))
 		) {
 			if (deferredCleanup) {
-				trackLateCleanup(deferredCleanup.then(cleanupHandle), {
+				const completion = deferredCleanup.then(() => cleanupHandle());
+				onCleanupDeferred(completion);
+				trackLateCleanup(completion, {
 					agentId: opts.agentId,
 					resource: "isolation",
 				});

@@ -603,11 +603,13 @@ export async function ensureIsolation(
 }
 
 /** Tear down a handle returned by {@link ensureIsolation}. */
-export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+export async function cleanupIsolation(handle: IsolationHandle, options: { strict?: boolean } = {}): Promise<void> {
+	let stopError: unknown;
 	try {
 		try {
 			await natives.isoStop(handle.backend, handle.mergedDir);
 		} catch (err) {
+			stopError = err;
 			logger.warn("isolation backend stop failed during cleanup", {
 				backend: handle.backend,
 				mergedDir: handle.mergedDir,
@@ -615,10 +617,13 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 			});
 		}
 	} finally {
-		// baseDir is the parent of the merged directory
-		const baseDir = path.dirname(handle.mergedDir);
-		await fs.rm(baseDir, { recursive: true, force: true });
+		if (!options.strict || stopError === undefined) {
+			// baseDir is the parent of the merged directory
+			const baseDir = path.dirname(handle.mergedDir);
+			await fs.rm(baseDir, { recursive: true, force: true });
+		}
 	}
+	if (options.strict && stopError !== undefined) throw stopError;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

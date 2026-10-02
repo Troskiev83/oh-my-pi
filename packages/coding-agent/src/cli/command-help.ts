@@ -163,5 +163,5 @@ export const usageHelp = {
 } satisfies CommandMetadata;
 
 export const worktreeHelp = {
-	description: "Add, list, or clear git worktrees (clone-first when enabled)",
+	description: "Add, list, clear, or safely release an owner's isolated descendants",
 } satisfies CommandMetadata;

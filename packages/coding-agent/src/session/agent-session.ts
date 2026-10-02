@@ -5227,6 +5227,7 @@ export class AgentSession implements SettingsScope {
 		try {
 			await withTimeout(task, 3_000, "Timed out draining auto-learn capture during dispose");
 		} catch (error) {
+			if (this.#isDisposed) this.#disposeFailure ??= error;
 			logger.warn("Auto-learn capture did not settle during dispose", { error: String(error) });
 		}
 	}
@@ -5288,6 +5289,28 @@ export class AgentSession implements SettingsScope {
 	 * double-drain the owned `AsyncJobManager` (issue #4080).
 	 */
 	#disposeCall?: Promise<void>;
+	#disposeBackground: Promise<void> | undefined;
+	#disposeFailure: unknown;
+
+	/** Native worktree release needs the actual drain, not dispose's bounded UI grace. */
+	async settleDispose(): Promise<void> {
+		try {
+			await this.#disposeCall;
+		} catch (error) {
+			this.#disposeFailure ??= error;
+		}
+		const results = await Promise.allSettled([
+			this.#disposeBackground ?? this.#cancelPostPromptTasks(),
+			this.#autolearnCaptureTask,
+			this.#agentId ? this.#asyncJobManager?.waitForOwnerJobs(this.#agentId) : undefined,
+			this.agent.waitForIdle(),
+			this.#drainInFlightEventHandlers(),
+		]);
+		for (const result of results) {
+			if (result.status === "rejected") this.#disposeFailure ??= result.reason;
+		}
+		if (this.#disposeFailure !== undefined) throw this.#disposeFailure;
+	}
 	dispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		if (!this.#disposeCall) this.#disposeCall = this.#doDispose(options);
 		return this.#disposeCall;
@@ -5333,6 +5356,7 @@ export class AgentSession implements SettingsScope {
 				logger.debug("Released owned browser tabs during dispose", { ownerId, released });
 			}
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
 		}
 	}
@@ -5389,6 +5413,7 @@ export class AgentSession implements SettingsScope {
 				"Timed out releasing native computer session during dispose",
 			);
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Failed to release native computer session during dispose", { error: String(error) });
 		}
 	}
@@ -5402,6 +5427,7 @@ export class AgentSession implements SettingsScope {
 				"Timed out disconnecting owned MCP manager during dispose",
 			);
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
 		}
 	}
@@ -5437,6 +5463,7 @@ export class AgentSession implements SettingsScope {
 		try {
 			await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 
@@ -5445,6 +5472,11 @@ export class AgentSession implements SettingsScope {
 		this.abortRetry();
 		this.abortCompaction();
 		const postPromptDrain = this.#cancelPostPromptTasks();
+		this.#disposeBackground = Promise.allSettled([postPromptDrain, this.#autolearnCaptureTask]).then(results => {
+			for (const result of results) {
+				if (result.status === "rejected") this.#disposeFailure ??= result.reason;
+			}
+		});
 		this.agent.abort();
 		try {
 			await withTimeout(
@@ -5453,6 +5485,7 @@ export class AgentSession implements SettingsScope {
 				"Timed out draining post-prompt tasks during dispose",
 			);
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
 		}
 		await this.#drainAutolearnCapture();
@@ -5466,6 +5499,7 @@ export class AgentSession implements SettingsScope {
 		try {
 			releaseSharpshooterSession(this);
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Session dispose: Sharpshooter release failed", { error: String(error) });
 		}
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
@@ -5484,6 +5518,7 @@ export class AgentSession implements SettingsScope {
 		]);
 		for (const result of results) {
 			if (result.status === "rejected") {
+				this.#disposeFailure ??= result.reason;
 				logger.warn("Session dispose subsystem failed during parallel teardown", {
 					error: String(result.reason),
 				});
@@ -5527,6 +5562,7 @@ export class AgentSession implements SettingsScope {
 			);
 			drained = true;
 		} catch (error) {
+			this.#disposeFailure ??= error;
 			logger.warn("Active agent run still settling at dispose deadline", { error: String(error) });
 		}
 

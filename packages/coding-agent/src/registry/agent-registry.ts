@@ -133,6 +133,63 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	readonly #roots = new WeakMap<AgentRef, AgentRef>();
+	readonly #sealed = new WeakSet<AgentRef>();
+	readonly #pending = new Map<AgentRef, number>();
+	readonly #owned = new Map<AgentRef, Set<AgentRef>>();
+	readonly #cleanupFailures = new WeakMap<AgentRef, unknown>();
+
+	ownedDescendants(owner: AgentRef): AgentRef[] {
+		return [...(this.#owned.get(owner) ?? [])];
+	}
+
+	/** Exact-generation ownership survives a parent's removal during cleanup. */
+	descendants(owner: AgentRef): AgentRef[] {
+		return this.list().filter(ref => ref !== owner && this.#roots.get(ref) === owner);
+	}
+
+	assertAdmission(id: string): void {
+		const ref = this.#refs.get(id);
+		const owner = ref && this.#roots.get(ref);
+		if (owner && this.#sealed.has(owner)) {
+			throw new Error(`Agent "${id}" cannot spawn or revive: its main session has released its worktree.`);
+		}
+	}
+
+	/** Reserve before task preflight/queueing, not after a child ref exists. */
+	beginTask(parentId: string): (cleanupError?: unknown) => void {
+		this.assertAdmission(parentId);
+		const parent = this.#refs.get(parentId);
+		const owner = parent && this.#roots.get(parent);
+		if (!owner) return () => {};
+		this.#pending.set(owner, (this.#pending.get(owner) ?? 0) + 1);
+		let settled = false;
+		return cleanupError => {
+			if (settled) return;
+			settled = true;
+			if (cleanupError !== undefined) this.#cleanupFailures.set(owner, cleanupError);
+			const remaining = (this.#pending.get(owner) ?? 1) - 1;
+			if (remaining === 0) this.#pending.delete(owner);
+			else this.#pending.set(owner, remaining);
+		};
+	}
+
+	assertReleaseReady(owner: AgentRef): void {
+		if (this.#refs.get(owner.id) !== owner || owner.kind !== "main" || !owner.session || owner.session.isDisposed) {
+			throw new Error("Main session ownership changed or the session is disposed.");
+		}
+		if (this.#pending.has(owner)) throw new Error("Main session has pending child task work.");
+		if (this.#cleanupFailures.has(owner)) throw this.#cleanupFailures.get(owner);
+		for (const ref of this.descendants(owner)) {
+			if (ref.status === "running" || ref.session?.isStreaming) {
+				throw new Error(`Child agent "${ref.id}" is running; release will not kill active work.`);
+			}
+		}
+	}
+
+	sealDescendants(owner: AgentRef): void {
+		this.#sealed.add(owner);
+	}
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
@@ -144,6 +201,8 @@ export class AgentRegistry {
 	}
 
 	register(input: RegisterInput): AgentRef {
+		if (input.parentId) this.assertAdmission(input.parentId);
+		this.assertAdmission(input.id);
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
@@ -159,6 +218,16 @@ export class AgentRegistry {
 			history: input.history,
 			lifecycle: input.lifecycle,
 		};
+		const parent = input.parentId && this.#refs.get(input.parentId);
+		const root = input.kind === "main" ? ref : parent ? this.#roots.get(parent) : undefined;
+		if (root) {
+			this.#roots.set(ref, root);
+			if (root !== ref) {
+				let owned = this.#owned.get(root);
+				if (!owned) this.#owned.set(root, (owned = new Set()));
+				owned.add(ref);
+			}
+		}
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });
 		return ref;
@@ -171,6 +240,8 @@ export class AgentRegistry {
 	 * id after its prior generation disappeared or was hard-killed.
 	 */
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
+		if (input.parentId) this.assertAdmission(input.parentId);
+		this.assertAdmission(input.id);
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
 		return current === expected && current.status === "parked" && !current.session ? current : undefined;
@@ -194,6 +265,7 @@ export class AgentRegistry {
 		if (!this.#matchesExpected(ref, expected)) {
 			return this.#rejectStatusUpdate(id, status, "session-ownership-changed");
 		}
+		if (status === "running" && ref.kind !== "main") this.assertAdmission(id);
 		// `aborted` is terminal: delayed progress/revival work from the killed
 		// generation must never transition the tombstone back to a live status.
 		if (ref.status === "aborted") {
@@ -293,6 +365,7 @@ export class AgentRegistry {
 		sessionFile?: string | null,
 		expected?: AgentRefExpectation,
 	): boolean {
+		this.assertAdmission(id);
 		const ref = this.#refs.get(id);
 		// Never attach a late-created session to a hard-killed tombstone. This
 		// closes the race between a parked reviver claiming the ref and finishing
@@ -315,6 +388,10 @@ export class AgentRegistry {
 		const ref = this.#refs.get(id);
 		if (!ref || !this.#matchesExpected(ref, expected)) return false;
 		this.#refs.delete(id);
+		if (ref.kind === "main") {
+			this.#owned.delete(ref);
+			this.#pending.delete(ref);
+		}
 		this.#emit({ type: "removed", ref });
 		return true;
 	}

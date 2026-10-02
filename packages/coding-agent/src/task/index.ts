@@ -52,7 +52,7 @@ import {
 } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
@@ -729,7 +729,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		agentId?: string;
 		detached: boolean;
 	}): SpawnRun {
-		return new SpawnRun(
+		const registry = this.session.agentRegistry ?? AgentRegistry.global();
+		const settle = registry.beginTask(this.session.getAgentId?.() ?? MAIN_AGENT_ID);
+		const launch = new SpawnRun(
 			this.#permit,
 			run =>
 				this.#runSpawn(
@@ -745,6 +747,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
+		void launch.result.then(
+			() => settle(),
+			() => settle(),
+		);
+		return launch;
 	}
 
 	/**
@@ -753,6 +760,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * reject the item, so a refusal halts further speculation for the call.
 	 */
 	async #startSpeculative(
+		toolCallId: string,
+		spawn: TaskParams,
+		index: number,
+		signal: AbortSignal,
+	): Promise<SpawnRun | undefined> {
+		const registry = this.session.agentRegistry ?? AgentRegistry.global();
+		const settle = registry.beginTask(this.session.getAgentId?.() ?? MAIN_AGENT_ID);
+		try {
+			return await this.#startSpeculativeAdmitted(toolCallId, spawn, index, signal);
+		} finally {
+			settle();
+		}
+	}
+
+	async #startSpeculativeAdmitted(
 		toolCallId: string,
 		spawn: TaskParams,
 		index: number,
@@ -824,11 +846,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
+		const registry = this.session.agentRegistry ?? AgentRegistry.global();
+		const settle = registry.beginTask(this.session.getAgentId?.() ?? MAIN_AGENT_ID);
 		const launchSession = this.#launchSessions.get(toolCallId);
 		this.#launchSessions.delete(toolCallId);
 		try {
 			return await this.#dispatch(toolCallId, rawParams, launchSession, signal, onUpdate);
 		} finally {
+			settle();
 			// No-op once dispatch adopted; otherwise nothing launched early may outlive the call.
 			launchSession?.discard("task call settled without adopting speculative launches");
 		}
@@ -1273,7 +1298,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// nothing about the worktree itself: the runner keeps it when captured
 			// changes could not be written, and names that path in the result.
 			const isolated = spawnParams.isolated === true;
-			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
+			const ref = aborted ? (this.session.agentRegistry ?? AgentRegistry.global()).get(agentId) : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
 				agentId,
 				aborted,
@@ -1426,7 +1451,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const statusText = `Background task ${agentId} failed.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
-					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
+					const hint = (this.session.agentRegistry ?? AgentRegistry.global()).get(agentId)
+						? await buildFollowUpHint(false)
+						: "";
 					throw new TaskJobError(`${message}${hint}`);
 				}
 			},
