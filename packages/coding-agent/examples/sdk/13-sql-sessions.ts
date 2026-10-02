@@ -18,7 +18,7 @@
  * if you need those off-host too.
  */
 
-import { createAgentSession, SessionManager, SqlSessionStorage } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, createAgentSession, SessionManager, SqlSessionStorage } from "@oh-my-pi/pi-coding-agent";
 import { SQL } from "bun";
 
 // Pick one — Bun.SQL auto-detects the dialect from the URL scheme.
@@ -41,12 +41,14 @@ const sessionDir = "/sessions/my-project";
 
 // 1) Fresh persistent session, JSONL backed by SQL.
 const { session } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: SessionManager.create(process.cwd(), sessionDir, storage),
 });
 console.log(`New SQL session (${storage.adapter}):`, session.sessionFile);
 
 // 2) Continue the most recent session for this `sessionDir`.
 const { session: continued } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: await SessionManager.continueRecent(process.cwd(), sessionDir, storage),
 });
 console.log("Resumed:", continued.sessionFile);

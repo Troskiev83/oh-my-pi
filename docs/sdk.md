@@ -97,6 +97,7 @@ function createAgentSession(
 For multiple concurrent top-level sessions in one process, pass a private
 `AgentRegistry` to each session. The default process-global registry admits
 only one `"Main"` identity per generation.
+The Agents Hub creation architect uses its own registry so generating an agent cannot replace or dispose the live host session.
 
 ## Session manager behavior (persistent vs in-memory)
 

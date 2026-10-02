@@ -8,12 +8,13 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
+import { createAgentsHubDeps } from "@oh-my-pi/pi-coding-agent/modes/agents-hub-deps";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { requestWorktreeRelease } from "@oh-my-pi/pi-coding-agent/registry/worktree-release";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getBaseConfigRoot, getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -150,6 +151,78 @@ describe("createAgentSession session storage isolation", () => {
 				expect(fs.existsSync(tempDir)).toBe(true);
 			} finally {
 				await session.dispose();
+			}
+		});
+	});
+
+	it("generates a Hub agent without replacing the live host or invalidating its closeout control", async () => {
+		await withTempConfigRoot(async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-hub-host-"));
+			tempDirs.push(cwd);
+			const registry = new AgentRegistry();
+			vi.spyOn(AgentRegistry, "global").mockReturnValue(registry);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled model");
+			vi.spyOn(sharedModelRegistry, "refresh").mockResolvedValue(undefined);
+			vi.spyOn(sharedModelRegistry, "getAvailable").mockReturnValue([model]);
+			vi.spyOn(AgentSession.prototype, "prompt").mockImplementation(async function (this: AgentSession) {
+				this.agent.appendMessage({
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text: '{"identifier":"code-auditor","whenToUse":"Use for audits","systemPrompt":"You audit code."}',
+						},
+					],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+				return true;
+			});
+			const settings = Settings.isolated();
+			const { session: host } = await createAgentSession({
+				cwd,
+				agentDir: path.join(cwd, "agent"),
+				agentRegistry: registry,
+				authStorage: sharedAuthStorage,
+				modelRegistry: sharedModelRegistry,
+				settings,
+				model,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+			});
+			const owner = registry.get("Main");
+			try {
+				const deps = createAgentsHubDeps(cwd, settings, sharedModelRegistry, () => ({
+					explicit: [],
+					configured: [],
+					configuredLevel: "user",
+					mode: "explicit-only",
+				}));
+				await deps.generateAgent("Create a read-only code auditor.", () => {});
+				expect(host.isDisposed).toBe(false);
+				expect(registry.get("Main")).toBe(owner);
+				const receipt = await requestWorktreeRelease({ pid: process.pid, cwd, check: true });
+				expect(receipt.ready).toBe(true);
+				expect(receipt.session_id).toBe(host.sessionManager.getSessionId());
+			} finally {
+				await host.dispose();
 			}
 		});
 	});

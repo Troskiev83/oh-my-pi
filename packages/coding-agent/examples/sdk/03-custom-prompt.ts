@@ -3,10 +3,11 @@
  *
  * Shows how to replace or modify the default system prompt.
  */
-import { createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
 
 // Option 1: Replace prompt entirely
 const { session: session1 } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	systemPrompt: [
 		`You are a helpful assistant that speaks like a pirate.
 Always end responses with "Arrr!"`,
@@ -26,6 +27,7 @@ console.log("\n");
 
 // Option 2: Modify default prompt (receives default, returns modified)
 const { session: session2 } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	systemPrompt: defaultPrompt => [
 		...defaultPrompt,
 		`## Additional Instructions

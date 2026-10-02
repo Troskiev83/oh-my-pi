@@ -3,22 +3,25 @@
  *
  * Control session persistence: in-memory, new file, continue, or open specific.
  */
-import { createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
 
 // In-memory (no persistence)
 const { session: inMemory } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: SessionManager.inMemory(),
 });
 console.log("In-memory session:", inMemory.sessionFile ?? "(none)");
 
 // New persistent session
 const { session: newSession } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: SessionManager.create(process.cwd()),
 });
 console.log("New session file:", newSession.sessionFile);
 
 // Continue most recent session (or create new if none)
 const { session: continued, modelFallbackMessage } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: await SessionManager.continueRecent(process.cwd()),
 });
 if (modelFallbackMessage) console.log("Note:", modelFallbackMessage);
@@ -33,6 +36,7 @@ for (const info of sessions.slice(0, 3)) {
 
 if (sessions.length > 0) {
 	const { session: opened } = await createAgentSession({
+		agentRegistry: new AgentRegistry(),
 		sessionManager: await SessionManager.open(sessions[0].path),
 	});
 	console.log(`\nOpened: ${opened.sessionId}`);

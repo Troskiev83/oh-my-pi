@@ -14,7 +14,7 @@
  * (S3, R2, GCS) if you need those off-host too.
  */
 
-import { createAgentSession, RedisSessionStorage, SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, createAgentSession, RedisSessionStorage, SessionManager } from "@oh-my-pi/pi-coding-agent";
 import { RedisClient } from "bun";
 
 // `bun:redis` picks up `REDIS_URL` / `VALKEY_URL` from the environment, or
@@ -34,12 +34,14 @@ const sessionDir = "/sessions/my-project";
 
 // 1) Fresh persistent session, JSONL backed by Redis.
 const { session } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: SessionManager.create(process.cwd(), sessionDir, storage),
 });
 console.log("New Redis session:", session.sessionFile);
 
 // 2) Continue the most recent session for this `sessionDir`.
 const { session: continued } = await createAgentSession({
+	agentRegistry: new AgentRegistry(),
 	sessionManager: await SessionManager.continueRecent(process.cwd(), sessionDir, storage),
 });
 console.log("Resumed:", continued.sessionFile);
